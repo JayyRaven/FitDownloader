@@ -14,6 +14,7 @@ const activeControlsEl = document.getElementById("active-controls");
 const cancelButtonEl = document.getElementById("cancel-button");
 const pauseResumeButtonEl = document.getElementById("pause-resume-button");
 const retryButtonEl = document.getElementById("retry-button");
+const resetButtonEl = document.getElementById("reset-button");
 
 let currentSession = null;
 let currentTabId = null;
@@ -207,6 +208,10 @@ function renderStatusView(session) {
 
     status.textContent = text;
     status.classList.add(cls);
+    if (item.state === "error" && item.error) {
+      status.title = item.error;
+      label.title = `${item.label || item.url} (${item.error})`;
+    }
 
     row.appendChild(label);
     row.appendChild(status);
@@ -243,14 +248,17 @@ function renderStatusView(session) {
     activeControlsEl.classList.add("visible");
     startButtonEl.style.display = "none";
     retryButtonEl.style.display = "none";
+    if (resetButtonEl) resetButtonEl.style.display = "none";
 
     const anyPaused = items.some((i) => i.state === "paused");
     pauseResumeButtonEl.textContent = anyPaused ? "Resume" : "Pause";
     pauseResumeButtonEl.className = anyPaused ? "btn-success" : "btn-warning";
   } else {
     activeControlsEl.classList.remove("visible");
-    startButtonEl.style.display = "";
+    startButtonEl.style.display = "none";
     startButtonEl.disabled = true;
+
+    if (resetButtonEl) resetButtonEl.style.display = "";
 
     if (hasErrors) {
       statusEl.textContent = `Finished \u2014 ${counts.error} download(s) failed.`;
@@ -372,6 +380,15 @@ retryButtonEl.addEventListener("click", () => {
     if (response?.ok) scanCurrentTab();
   });
 });
+
+if (resetButtonEl) {
+  resetButtonEl.addEventListener("click", () => {
+    resetButtonEl.style.display = "none";
+    chrome.runtime.sendMessage({ type: "reset_batch" }, (response) => {
+      if (response?.ok) scanCurrentTab();
+    });
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Settings

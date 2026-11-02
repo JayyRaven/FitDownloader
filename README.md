@@ -30,8 +30,8 @@ FitDownloader is a simple Chrome extension that scans supported FitGirl repack p
 ## Notes
 
 - The extension only requests access to `fitgirl-repacks.site` and `fuckingfast.co`.
+- **Smart Folder Selection**: The first download in a set prompts you with "Save As" so you can pick the destination folder; all subsequent downloads in the set automatically save to that exact location without prompting.
 - Downloads run through Chrome's standard download manager.
-- Chrome's **Ask where to save each file before downloading** setting still applies. Turn it off in Chrome if you want downloads to start without save prompts.
 - If the target sites change their HTML structure, link detection may need to be updated.
 
 

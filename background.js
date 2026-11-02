@@ -23,6 +23,49 @@ let downloadIdToKey = new Map();
 let downloadMapLoaded = false;
 const ACTIVE_ITEM_STATES = new Set(["queued", "starting", "downloading", "paused"]);
 
+// Track configs for our initiated downloads
+const pendingDownloadConfigsByUrl = new Map();
+const downloadConfigsById = new Map();
+
+// Intercept filename determination so only the first file prompts the user,
+// and all subsequent files automatically save to the same location without asking.
+chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
+  let config = downloadConfigsById.get(item.id);
+  if (!config && item.url) {
+    config = pendingDownloadConfigsByUrl.get(item.url);
+  }
+
+  // Not our extension's download: do not interfere
+  if (!config) {
+    return;
+  }
+
+  if (item.id && config) {
+    downloadConfigsById.set(item.id, config);
+  }
+
+  // First download in set: let Chrome's Save As prompt proceed
+  if (config.isFirstInBatch) {
+    if (config.filename) {
+      suggest({
+        filename: config.filename,
+        conflictAction: "uniquify"
+      });
+    } else {
+      suggest();
+    }
+    return;
+  }
+
+  // Subsequent downloads in set: route to target filename with conflictAction uniquify,
+  // which suppresses the Save As prompt and saves into the same location.
+  const targetName = config.filename || item.filename;
+  suggest({
+    filename: targetName,
+    conflictAction: "uniquify"
+  });
+});
+
 function clampConcurrency(value) {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) return DEFAULT_MAX_CONCURRENT_DOWNLOADS;
@@ -95,8 +138,9 @@ function normalizeSessionItem(item) {
   return {
     url: link.url,
     label: link.label,
-    state: typeof item?.state === "string" ? item.state : "queued",
-    downloadId: Number.isInteger(item?.downloadId) ? item.downloadId : null
+    state: item && typeof item.state === "string" ? item.state : "queued",
+    downloadId: item && Number.isInteger(item.downloadId) ? item.downloadId : null,
+    error: item && typeof item.error === "string" ? item.error : null
   };
 }
 
@@ -109,6 +153,9 @@ function normalizeSessionShape(session) {
       hasStarted: false,
       paused: false,
       generation: 0,
+      firstDownloadPrompted: false,
+      firstDownloadDetermined: false,
+      subfolder: "",
       allItems: [],
       items: []
     };
@@ -132,6 +179,9 @@ function normalizeSessionShape(session) {
     hasStarted: session.hasStarted === true,
     paused: session.paused === true,
     generation: Number.isInteger(session.generation) ? session.generation : 0,
+    firstDownloadPrompted: session.firstDownloadPrompted === true,
+    firstDownloadDetermined: session.firstDownloadDetermined === true,
+    subfolder: typeof session.subfolder === "string" ? session.subfolder : "",
     allItems,
     items: normalizedItems
   };
@@ -167,19 +217,24 @@ function shouldReuseSessionForTab(session, tab) {
   const samePage =
     normalizeSessionUrl(session.sourceUrl) === normalizeSessionUrl(tab?.url);
 
+  // If there are downloads currently in progress (downloading or queued), keep the active run
   if (activeRun) {
-    // While work is actively queued/running, preserve tab-scoped batch state
-    // even if the user navigates within the tab.
     return true;
   }
 
-  // Pre-start state can be reused on the same page.
-  if (!session.hasStarted && samePage) {
-    return true;
+  // If downloads are NOT active:
+  // If the batch was started (or finished), or if items were filtered down to a subset,
+  // do NOT reuse that shrunk session. Force a fresh link scan!
+  if (session.hasStarted) {
+    return false;
   }
 
-  // Terminal or cancelled runs should not linger across page changes.
-  return false;
+  if (Array.isArray(session.allItems) && Array.isArray(session.items) && session.items.length < session.allItems.length) {
+    return false;
+  }
+
+  // Pre-start state can be reused on the same page only if it hasn't started yet and has all items
+  return samePage;
 }
 
 function isSessionGenerationCurrent(tabId, generation) {
@@ -354,7 +409,7 @@ async function extractFuckingFastLinks(tabId) {
       const rawTitle = document.title || "";
       const title = rawTitle.replace(/ - FitGirl Repacks.*/i, "").trim();
 
-      // Try to scope to the main post content if possible
+      // Scan containers for FuckingFast links
       const containers = [
         document.querySelector(".entry-content"),
         document.querySelector(".post"),
@@ -365,16 +420,24 @@ async function extractFuckingFastLinks(tabId) {
 
       for (const container of containers) {
         const anchors = container.querySelectorAll(
-          'a[href^="https://fuckingfast.co/"], a[href^="http://fuckingfast.co/"]'
+          'a[href*="fuckingfast.co/"], a[href*="fuckingfast.net/"]'
         );
         anchors.forEach((a) => {
           if (a.href) {
-            const label = a.textContent.trim() || a.href;
-            items.push({ url: a.href, label });
+            let anchorLabel = a.textContent.trim();
+            if (!anchorLabel || anchorLabel === a.href) {
+              if (a.href.includes("#")) {
+                try {
+                  anchorLabel = decodeURIComponent(a.href.split("#")[1]);
+                } catch (e) {
+                  anchorLabel = a.href.split("#")[1];
+                }
+              }
+            }
+            items.push({ url: a.href, label: anchorLabel || a.href });
           }
         });
-        // If we found some inside a more specific container, no need to fall back further
-        if (items.length > 0 && container !== document.body) {
+        if (items.length > 0) {
           break;
         }
       }
@@ -388,6 +451,28 @@ async function extractFuckingFastLinks(tabId) {
         unique.push(item);
       }
 
+      // Always also scan entire document body text/HTML for any other FuckingFast links
+      // (some repack pages format links inside accordions, tables, or plain text)
+      const bodyText = document.documentElement ? document.documentElement.innerHTML : (document.body.innerText || "");
+      const matches =
+        bodyText.match(
+          /https?:\/\/(?:[a-zA-Z0-9-]+\.)*fuckingfast\.(?:co|net)\/[^\s"'<>\\]+/g
+        ) || [];
+      for (const u of matches) {
+        if (!seen.has(u)) {
+          seen.add(u);
+          let textLabel = u;
+          if (u.includes("#")) {
+            try {
+              textLabel = decodeURIComponent(u.split("#")[1]);
+            } catch (e) {
+              textLabel = u.split("#")[1];
+            }
+          }
+          unique.push({ url: u, label: textLabel });
+        }
+      }
+
       return { title, items: unique };
     }
   });
@@ -399,66 +484,428 @@ async function extractFuckingFastLinks(tabId) {
   return { title: "", items: [] };
 }
 
-/**
- * Given a FuckingFast landing URL, fetch its HTML and extract the
- * underlying direct /dl/... URL that the page's download() function
- * would open. FuckingFast currently serves these from dl.fuckingfast.co.
- */
-async function getDirectDownloadUrl(fuckingFastUrl) {
-  const attempts = [fuckingFastUrl, swapProtocol(fuckingFastUrl)];
-  let lastError;
+function extractFuckingFastId(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== "string") return null;
+  try {
+    const parsed = new URL(rawUrl);
+    const parts = parsed.pathname.split("/").filter(Boolean);
+    if (!parts.length) return null;
+    if (parts[parts.length - 1] === "go" && parts.length > 1) {
+      return parts[parts.length - 2];
+    }
+    return parts[parts.length - 1];
+  } catch (e) {
+    const clean = rawUrl.split("#")[0].split("?")[0].replace(/\/+$/, "");
+    return clean.split("/").pop() || null;
+  }
+}
 
-  for (const url of attempts) {
-    try {
-      const res = await fetch(url, { credentials: "include" });
-
-      if (!res.ok) {
-        lastError = new Error(
-          `Failed to fetch FuckingFast page (${res.status} ${res.statusText})`
-        );
-        continue;
+function extractFilenameFromUrl(rawUrl, defaultLabel) {
+  if (typeof rawUrl === "string" && rawUrl.includes("#")) {
+    const hash = rawUrl.split("#")[1];
+    if (hash) {
+      try {
+        const decoded = decodeURIComponent(hash).trim();
+        if (decoded) return decoded;
+      } catch (e) {
+        return hash.trim();
       }
-
-      const html = await res.text();
-
-      const match = html.match(
-        /https?:\/\/(?:dl\.)?fuckingfast\.co\/dl\/[^\s"'<>\\]+/
-      );
-      if (!match) {
-        lastError = new Error("Direct /dl/ URL not found in FuckingFast page HTML");
-        continue;
-      }
-
-      return match[0];
-    } catch (err) {
-      lastError = err;
     }
   }
+  if (typeof defaultLabel === "string" && defaultLabel.includes(".")) {
+    return defaultLabel.trim();
+  }
+  return null;
+}
 
-  throw lastError;
+function waitForTabComplete(tabId, timeoutMs = 15000) {
+  return new Promise((resolve) => {
+    let resolved = false;
+    const timer = setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve();
+      }
+    }, timeoutMs);
+
+    function listener(updatedTabId, changeInfo) {
+      if (updatedTabId === tabId && changeInfo.status === "complete") {
+        if (!resolved) {
+          resolved = true;
+          clearTimeout(timer);
+          chrome.tabs.onUpdated.removeListener(listener);
+          resolve();
+        }
+      }
+    }
+
+    chrome.tabs.onUpdated.addListener(listener);
+
+    chrome.tabs.get(tabId, (tab) => {
+      if (chrome.runtime.lastError || !tab) return;
+      if (tab.status === "complete" && !resolved) {
+        resolved = true;
+        clearTimeout(timer);
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve();
+      }
+    });
+  });
+}
+
+async function attemptDirectPost(origin, fileId, cleanUrl) {
+  const goUrl = `${origin}/f/${fileId}/go`;
+  const res = await fetch(goUrl, {
+    method: "POST",
+    headers: {
+      "HX-Request": "true",
+      "HX-Current-URL": cleanUrl,
+      Referer: cleanUrl,
+      "Cache-Control": "no-cache",
+      Accept: "*/*"
+    },
+    credentials: "include",
+    redirect: "follow"
+  });
+
+  if (res.status === 429) {
+    throw new Error("RATE_LIMITED");
+  }
+
+  if (res.status === 403) {
+    throw new Error("CLOUDFLARE_BLOCKED");
+  }
+
+  const hx = res.headers.get("hx-redirect") || res.headers.get("hx-location");
+  if (hx) {
+    return new URL(hx, origin).href;
+  }
+
+  if (
+    res.redirected &&
+    res.url &&
+    !res.url.includes("/f/") &&
+    !res.url.endsWith("/go")
+  ) {
+    return res.url;
+  }
+
+  const loc = res.headers.get("location");
+  if (loc) {
+    return new URL(loc, origin).href;
+  }
+
+  if (res.ok) {
+    const text = await res.text();
+    const dlMatch = text.match(
+      /https?:\/\/(?:[a-zA-Z0-9-]+\.)*fuckingfast\.[a-z]+\/dl\/[^\s"'<>\\]+/i
+    );
+    if (dlMatch) return dlMatch[0];
+    const anyDlMatch = text.match(/https?:\/\/[^\s"'<>]+\/dl\/[^\s"'<>\\]+/i);
+    if (anyDlMatch) return anyDlMatch[0];
+  }
+
+  throw new Error("No direct link returned from POST");
+}
+
+async function attemptGet(cleanUrl, origin) {
+  const res = await fetch(cleanUrl, {
+    credentials: "include",
+    headers: {
+      Accept:
+        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    }
+  });
+
+  if (res.status === 403) throw new Error("CLOUDFLARE_BLOCKED");
+  if (res.status === 429) throw new Error("RATE_LIMITED");
+
+  if (res.ok) {
+    const html = await res.text();
+    const match = html.match(
+      /https?:\/\/(?:[a-zA-Z0-9-]+\.)*fuckingfast\.[a-z]+\/dl\/[^\s"'<>\\]+/i
+    );
+    if (match) return match[0];
+  }
+  throw new Error("Direct link not found in GET HTML");
+}
+
+async function resolveViaTab(cleanUrl, fileId, origin) {
+  const tab = await chrome.tabs.create({ url: cleanUrl, active: false });
+  try {
+    await waitForTabComplete(tab.id, 15000);
+
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      world: "MAIN",
+      func: async (id) => {
+        const start = Date.now();
+        while (Date.now() - start < 12000) {
+          const title = document.title || "";
+          if (
+            !title.includes("Just a moment") &&
+            !document.querySelector("#challenge-running") &&
+            !document.querySelector("#cf-challenge-running")
+          ) {
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 600));
+        }
+
+        try {
+          const res = await fetch(`/f/${id}/go`, {
+            method: "POST",
+            headers: {
+              "HX-Request": "true",
+              "HX-Current-URL": window.location.href,
+              "Cache-Control": "no-cache"
+            }
+          });
+          const hx =
+            res.headers.get("hx-redirect") || res.headers.get("hx-location");
+          if (hx) return new URL(hx, window.location.origin).href;
+          if (res.redirected && res.url) return res.url;
+          const body = await res.text();
+          const match = body.match(/https?:\/\/[^\s"'<>]+\/dl\/[^\s"'<>\\]+/i);
+          if (match) return match[0];
+        } catch (e) {
+          // continue
+        }
+
+        const dlAnchor = document.querySelector('a[href*="/dl/"]');
+        if (dlAnchor && dlAnchor.href) return dlAnchor.href;
+
+        return null;
+      },
+      args: [fileId]
+    });
+
+    if (result) return result;
+    throw new Error("Could not extract download link via background tab");
+  } finally {
+    try {
+      await chrome.tabs.remove(tab.id);
+    } catch (e) {
+      // ignore
+    }
+  }
+}
+
+/**
+ * Given a FuckingFast landing URL, extract the underlying direct /dl/... URL
+ * using HTMX POST, fallback GET, or background tab with Cloudflare bypass.
+ */
+async function getDirectDownloadUrl(fuckingFastUrl) {
+  const fileId = extractFuckingFastId(fuckingFastUrl);
+  if (!fileId) {
+    throw new Error("Invalid FuckingFast URL: " + fuckingFastUrl);
+  }
+
+  let origin = "https://fuckingfast.co";
+  try {
+    const u = new URL(fuckingFastUrl);
+    origin = u.origin;
+  } catch (e) {
+    // fallback
+  }
+
+  const cleanUrl = `${origin}/${fileId}`;
+
+  // Attempt 1: Direct HTMX POST
+  try {
+    return await attemptDirectPost(origin, fileId, cleanUrl);
+  } catch (err) {
+    if (err.message === "RATE_LIMITED") {
+      // Wait 3 seconds and retry once
+      await new Promise((r) => setTimeout(r, 3000));
+      try {
+        return await attemptDirectPost(origin, fileId, cleanUrl);
+      } catch (retryErr) {
+        // If still rate limited, try tab fallback
+      }
+    }
+
+    // Attempt 2: Try GET request (for legacy pages / mirrors)
+    try {
+      return await attemptGet(cleanUrl, origin);
+    } catch (getErr) {
+      // If blocked or not found, proceed to tab fallback
+    }
+
+    // Attempt 3: Background tab resolution (solves Cloudflare Turnstile if present)
+    return await resolveViaTab(cleanUrl, fileId, origin);
+  }
+}
+
+// Global resolution chain to space out requests to FuckingFast and prevent 429 rate limits
+let resolveQueue = Promise.resolve();
+function scheduleResolve(fn) {
+  const next = resolveQueue.then(async () => {
+    try {
+      return await fn();
+    } finally {
+      // 1-second delay between resolution attempts
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  });
+  resolveQueue = next.catch(() => {});
+  return next;
+}
+
+function extractSubfolder(fullPath) {
+  if (!fullPath || typeof fullPath !== "string") return "";
+  const normalized = fullPath.replace(/\\/g, "/");
+  const lastSlash = normalized.lastIndexOf("/");
+  if (lastSlash === -1) return "";
+  const dir = normalized.substring(0, lastSlash);
+
+  const lower = dir.toLowerCase();
+  const dlIdx = lower.lastIndexOf("/downloads");
+  if (dlIdx !== -1) {
+    const sub = dir.substring(dlIdx + "/downloads".length).replace(/^\/+/, "");
+    if (sub) return sub;
+  }
+  return "";
+}
+
+function waitForFirstDownloadDestination(downloadId) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let pollInterval = null;
+
+    function cleanup() {
+      settled = true;
+      if (pollInterval) {
+        clearInterval(pollInterval);
+        pollInterval = null;
+      }
+      chrome.downloads.onChanged.removeListener(listener);
+    }
+
+    function checkItem() {
+      if (settled) return;
+      chrome.downloads.search({ id: downloadId }, (results) => {
+        if (settled) return;
+        if (chrome.runtime.lastError) return;
+        if (!results || !results[0]) return;
+
+        const item = results[0];
+        // If filename is now populated and user didn't cancel
+        if (item.filename && item.filename.length > 0) {
+          // If state is not interrupted or user didn't cancel
+          if (item.state !== "interrupted") {
+            cleanup();
+            resolve(item.filename);
+            return;
+          }
+        }
+
+        if (item.state === "interrupted") {
+          cleanup();
+          reject(new Error(item.error || "Download interrupted"));
+          return;
+        }
+      });
+    }
+
+    // Check immediately
+    checkItem();
+
+    // Poll every 400ms to catch when the user confirms the Save As dialog
+    pollInterval = setInterval(checkItem, 400);
+
+    function listener(delta) {
+      if (delta.id !== downloadId || settled) return;
+
+      if (delta.filename && delta.filename.current) {
+        cleanup();
+        resolve(delta.filename.current);
+        return;
+      }
+
+      if (delta.error && delta.error.current) {
+        cleanup();
+        reject(new Error(delta.error.current));
+        return;
+      }
+
+      if (delta.state && delta.state.current === "interrupted") {
+        cleanup();
+        reject(new Error("Download interrupted"));
+        return;
+      }
+
+      // Any progress indicator (bytesReceived, totalBytes, state change)
+      // means the user confirmed the Save As prompt and download has started
+      if (delta.bytesReceived || delta.state?.current === "in_progress" || delta.canResume) {
+        checkItem();
+      }
+    }
+
+    chrome.downloads.onChanged.addListener(listener);
+  });
 }
 
 /**
  * Start a Chrome download for the given URL and resolve with its downloadId.
+ * @param {string} dlUrl
+ * @param {string|null} filename
+ * @param {boolean} isFirstInBatch
+ * @param {boolean} saveAs
  */
-function startDownload(dlUrl) {
+function startDownload(dlUrl, filename, isFirstInBatch = false, saveAs = false) {
   return new Promise((resolve, reject) => {
-    chrome.downloads.download(
-      {
-        url: dlUrl,
-        saveAs: false
-      },
-      (downloadId) => {
-        if (chrome.runtime.lastError || downloadId === undefined) {
-          reject(
-            chrome.runtime.lastError ||
-              new Error("chrome.downloads.download() failed")
-          );
+    const options = {
+      url: dlUrl,
+      saveAs: saveAs === true
+    };
+
+    let cleanName = null;
+    if (filename && typeof filename === "string") {
+      cleanName = filename
+        .replace(/\\/g, "/")
+        .replace(/[<>:"|?*]/g, "_")
+        .trim();
+      if (cleanName) {
+        options.filename = cleanName;
+      }
+    }
+
+    const config = {
+      filename: cleanName,
+      isFirstInBatch: isFirstInBatch === true
+    };
+    pendingDownloadConfigsByUrl.set(dlUrl, config);
+
+    chrome.downloads.download(options, (downloadId) => {
+      if (chrome.runtime.lastError || downloadId === undefined) {
+        pendingDownloadConfigsByUrl.delete(dlUrl);
+        // Fallback without explicit filename if Chrome rejected the filename
+        if (options.filename) {
+          const fallbackOptions = { url: dlUrl, saveAs: saveAs === true };
+          chrome.downloads.download(fallbackOptions, (fallbackId) => {
+            if (chrome.runtime.lastError || fallbackId === undefined) {
+              reject(
+                chrome.runtime.lastError ||
+                  new Error("chrome.downloads.download() failed")
+              );
+            } else {
+              downloadConfigsById.set(fallbackId, config);
+              resolve(fallbackId);
+            }
+          });
           return;
         }
-        resolve(downloadId);
+        reject(
+          chrome.runtime.lastError ||
+            new Error("chrome.downloads.download() failed")
+        );
+        return;
       }
-    );
+      downloadConfigsById.set(downloadId, config);
+      resolve(downloadId);
+    });
   });
 }
 
@@ -508,7 +955,16 @@ async function pumpQueueForTab(tabId, expectedGeneration) {
     (item) => item.state === "starting" || item.state === "downloading"
   ).length;
 
-  let availableSlots = maxConcurrent - activeCount;
+  // If the first download hasn't determined its destination yet,
+  // allow only 1 active item (the first one) and wait for the user to complete the Save As dialog.
+  if (!session.firstDownloadDetermined) {
+    if (activeCount > 0) {
+      return;
+    }
+  }
+
+  const effectiveMax = session.firstDownloadDetermined ? maxConcurrent : 1;
+  let availableSlots = effectiveMax - activeCount;
   if (availableSlots <= 0) return;
 
   await loadDownloadMap();
@@ -528,20 +984,40 @@ async function pumpQueueForTab(tabId, expectedGeneration) {
           return;
         }
 
-        const dlUrl = await getDirectDownloadUrl(activeItemBeforeFetch.url);
+        const filename = extractFilenameFromUrl(
+          activeItemBeforeFetch.url,
+          activeItemBeforeFetch.label
+        );
+
+        const dlUrl = await scheduleResolve(() =>
+          getDirectDownloadUrl(activeItemBeforeFetch.url)
+        );
 
         const activeItemBeforeDownload = getSessionItemForRun(tabId, index, generation);
         if (!activeItemBeforeDownload || activeItemBeforeDownload.state !== "starting") {
           return;
         }
 
+        // The first file in the set asks where to save (saveAs: true).
+        // Subsequent files automatically download to that same location (saveAs: false).
+        const isFirst = !session.firstDownloadPrompted;
+        if (isFirst) {
+          session.firstDownloadPrompted = true;
+          await saveSessions();
+        }
+
+        const currentSubfolder = session.subfolder || "";
+        const finalFilename = currentSubfolder && filename
+          ? `${currentSubfolder}/${filename}`
+          : filename;
+
         let downloadId;
         try {
-          downloadId = await startDownload(dlUrl);
+          downloadId = await startDownload(dlUrl, finalFilename, isFirst, isFirst);
         } catch (dlErr) {
           const altUrl = swapProtocol(dlUrl);
           console.warn("Download failed, retrying with", altUrl, dlErr);
-          downloadId = await startDownload(altUrl);
+          downloadId = await startDownload(altUrl, finalFilename, isFirst, isFirst);
         }
 
         const activeItemAfterDownload = getSessionItemForRun(tabId, index, generation);
@@ -556,14 +1032,38 @@ async function pumpQueueForTab(tabId, expectedGeneration) {
 
         activeItemAfterDownload.downloadId = downloadId;
         activeItemAfterDownload.state = "downloading";
+        activeItemAfterDownload.error = null;
         downloadIdToKey.set(downloadId, { tabId, index, generation });
         await Promise.all([saveSessions(), saveDownloadMap()]);
         broadcastSessionUpdate(tabId);
+
+        // When the first file is prompted, wait for the user to confirm the Save As dialog.
+        // Once the destination is selected, mark it determined and immediately pump the rest of the files!
+        if (isFirst) {
+          try {
+            const chosenPath = await waitForFirstDownloadDestination(downloadId);
+            session.subfolder = extractSubfolder(chosenPath);
+            session.firstDownloadDetermined = true;
+            await saveSessions();
+            broadcastSessionUpdate(tabId);
+            // Resume pumping remaining items in the set
+            pumpQueueForTab(tabId, generation);
+          } catch (promptErr) {
+            if (promptErr && promptErr.message === "USER_CANCELED") {
+              activeItemAfterDownload.state = "cancelled";
+              session.hasStarted = false;
+              await saveSessions();
+              broadcastSessionUpdate(tabId);
+              return;
+            }
+          }
+        }
       } catch (err) {
         const activeItemOnError = getSessionItemForRun(tabId, index, generation);
         if (!activeItemOnError) return;
         console.warn("Failed to start FuckingFast URL:", activeItemOnError.url, err);
         activeItemOnError.state = "error";
+        activeItemOnError.error = err.message || String(err);
         activeItemOnError.downloadId = null;
         await saveSessions();
         broadcastSessionUpdate(tabId);
@@ -610,8 +1110,11 @@ chrome.downloads.onChanged.addListener((delta) => {
     item.downloadId = null;
     if (state === "complete") {
       item.state = "completed";
+      item.error = null;
     } else {
-      item.state = delta.error?.current === "USER_CANCELED" ? "cancelled" : "error";
+      const errCode = delta.error?.current;
+      item.state = errCode === "USER_CANCELED" ? "cancelled" : "error";
+      item.error = errCode || "Download interrupted";
     }
     await Promise.all([saveSessions(), saveDownloadMap()]);
     broadcastSessionUpdate(key.tabId);
@@ -620,7 +1123,21 @@ chrome.downloads.onChanged.addListener((delta) => {
   })();
 });
 
-// Clean up tab-scoped sessions when a tab is closed
+// Clean up tab-scoped sessions when a tab is closed or navigated/reloaded
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status === "loading") {
+    (async () => {
+      await loadSessions();
+      const session = sessions[tabId];
+      // When page reloads/navigates, if no downloads are actively in progress, clear the session so fresh links are found
+      if (session && !hasActiveItems(session)) {
+        delete sessions[tabId];
+        await saveSessions();
+      }
+    })();
+  }
+});
+
 chrome.tabs.onRemoved.addListener((tabId) => {
   (async () => {
     await loadSessions();
@@ -736,6 +1253,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         session.items = selectedItems;
         session.hasStarted = true;
         session.paused = false;
+        session.firstDownloadPrompted = false;
+        session.firstDownloadDetermined = false;
+        session.subfolder = "";
 
         // Clear mapping entries for this tab
         await loadDownloadMap();
@@ -832,6 +1352,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         session.generation = getSessionGeneration(session) + 1;
         session.hasStarted = false;
         session.paused = false;
+        session.firstDownloadPrompted = false;
+        session.firstDownloadDetermined = false;
+        session.subfolder = "";
 
         // Cancel all active and queued downloads
         await loadDownloadMap();
@@ -952,6 +1475,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         for (const item of session.items) {
           if (item.state === "error") {
             item.state = "queued";
+            item.error = null;
             item.downloadId = null;
             requeued++;
           }
@@ -969,6 +1493,33 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
 
         sendResponse({ ok: true });
+      } catch (err) {
+        sendResponse({ ok: false, error: err.message || String(err) });
+      }
+    })();
+    return true;
+  }
+
+  if (message.type === "reset_batch") {
+    (async () => {
+      try {
+        await loadSessions();
+        const [tab] = await chrome.tabs.query({
+          active: true,
+          currentWindow: true
+        });
+        if (!tab || !tab.url) {
+          sendResponse({ ok: false, error: "No active FitGirl tab found." });
+          return;
+        }
+        const tabId = tab.id;
+        const existingSession = sessions[tabId];
+        const currentGen = existingSession ? getSessionGeneration(existingSession) : 0;
+        const refreshed = await rebuildSessionForTab(tab, currentGen + 1);
+        sessions[tabId] = refreshed;
+        await saveSessions();
+        broadcastSessionUpdate(tabId);
+        sendResponse({ ok: true, session: refreshed });
       } catch (err) {
         sendResponse({ ok: false, error: err.message || String(err) });
       }
